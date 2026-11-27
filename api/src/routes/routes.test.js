@@ -1,0 +1,340 @@
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { app } from '../app.js';
+import { pool } from '../db/client.js';
+import { mongo } from '../db/mongo.js';
+import { sign } from '../lib/auth.js';
+import jwt from 'jsonwebtoken';
+import { vi } from 'vitest';
+import { config } from '../config.js';
+import { publishedNotices, clearCmsCache } from '../cms/contentful.js';
+
+// M8 (skuld 9): säkerhetstester mot REST-API:et, mot riktig databas – samma upplägg som
+// GraphQL-testerna i graphql/server.test.js (lokalt mot compose-databaserna, i pipelinen mot
+// services). Appen startas på en ledig port (0) och stängs efter testerna.
+//
+// Regeln från docs/testing.md: varje lagat hål har ett test som var RÖTT före fixen. Det är
+// testet som bevisar hålet – inte en skärmdump – och det som hindrar hålet från att komma tillbaka.
+let server;
+let base;
+const api = (path, { method = 'GET', body, token } = {}) =>
+  fetch(`${base}${path}`, {
+    method,
+    headers: {
+      'content-type': 'application/json',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+const userRow = async (id) =>
+  (await pool.query('select id, email, role, display_name from users where id = $1', [id])).rows[0];
+
+beforeAll(async () => {
+  server = app.listen(0);
+  await new Promise((resolve) => server.once('listening', resolve));
+  base = `http://127.0.0.1:${server.address().port}`;
+});
+
+afterAll(async () => {
+  await new Promise((resolve) => server.close(resolve));
+  await pool.end();
+  await mongo.close();
+});
+
+describe('A07 Authentication Failures – inloggningen', () => {
+  it('svaret på en lyckad inloggning innehåller token och användaren – men aldrig password_hash', async () => {
+    const user = await userRow(1);
+    const res = await api('/api/auth/login', { method: 'POST', body: { email: user.email, password: 'hemligt123' } });
+    expect(res.status).toBe(200);
+    const svar = await res.json();
+    expect(svar.token).toEqual(expect.any(String));
+    expect(svar.user.email).toBe(user.email);
+    expect(JSON.stringify(svar)).not.toContain('password_hash');
+    expect(JSON.stringify(svar)).not.toContain('hemligt123');
+  });
+
+  it('fel lösenord och okänd e-post ger samma svar (401, samma text)', async () => {
+    const user = await userRow(1);
+    const felLosen = await api('/api/auth/login', { method: 'POST', body: { email: user.email, password: 'fel' } });
+    const okand = await api('/api/auth/login', { method: 'POST', body: { email: 'finns.inte@example.com', password: 'fel' } });
+    expect(felLosen.status).toBe(401);
+    expect(okand.status).toBe(401);
+    expect(await felLosen.json()).toEqual(await okand.json());
+  });
+
+  it('lösenordet i databasen är hashat, inte klartext', async () => {
+    const { rows } = await pool.query("select count(*)::int as n from users where password_hash like 'plaintext:%'");
+    expect(rows[0].n).toBe(0);
+  });
+
+  it('registrering med för kort lösenord ger 400 med vad som var fel', async () => {
+    const res = await api('/api/auth/register', {
+      method: 'POST',
+      body: { email: 'ny@example.com', password: 'kort', displayName: 'Ny' },
+    });
+    expect(res.status).toBe(400);
+    const svar = await res.json();
+    expect(svar.error).toBe('ogiltig indata');
+    expect(svar.issues[0].path).toBe('password');
+  });
+});
+
+describe('A01 Broken Access Control – vems tur är det?', () => {
+  it('DELETE /api/tours/:id utan token ger 401 och turen finns kvar', async () => {
+    const res = await api('/api/tours/1', { method: 'DELETE' });
+    expect(res.status).toBe(401);
+    const { rows } = await pool.query('select id from tours where id = 1');
+    expect(rows).toHaveLength(1);
+  });
+
+  it('en medlem kan inte ta bort någon annans tur (403)', async () => {
+    const tour = (await pool.query('select id, user_id from tours where id = 1')).rows[0];
+    // en annan medlem än turens ägare (och inte redaktör)
+    const other = (
+      await pool.query("select id, email, role from users where id <> $1 and role = 'member' limit 1", [tour.user_id])
+    ).rows[0];
+    const res = await api(`/api/tours/${tour.id}`, { method: 'DELETE', token: sign(other) });
+    expect(res.status).toBe(403);
+    expect((await pool.query('select id from tours where id = 1')).rows).toHaveLength(1);
+  });
+
+  it('ägaren kan ta bort sin egen tur', async () => {
+    const owner = await userRow(1);
+    const created = await pool.query(
+      `insert into tours (user_id, title, started_at, distance_m) values ($1, 'Testtur M8', now(), 100) returning id`,
+      [owner.id],
+    );
+    const res = await api(`/api/tours/${created.rows[0].id}`, { method: 'DELETE', token: sign(owner) });
+    expect(res.status).toBe(200);
+    expect((await pool.query('select id from tours where id = $1', [created.rows[0].id])).rows).toHaveLength(0);
+  });
+
+  it('POST /api/photos utan token ger 401 – uppladdning kräver inloggning', async () => {
+    const res = await api('/api/photos', {
+      method: 'POST',
+      body: { tourId: 1, filename: 'fjall.jpg', width: 4000, height: 3000 },
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('A01 – redaktionens routes (fredagens labb)', () => {
+  const body = { title: 'Ny titel', region: 'Dalarna', difficulty: 'medel', lengthKm: 12, bodyHtml: '<p>x</p>', published: true };
+
+  it('PUT /api/guides/:id utan token ger 401', async () => {
+    const res = await api('/api/guides/1', { method: 'PUT', body });
+    expect(res.status).toBe(401);
+  });
+
+  it('en medlem får inte ändra guider (403) – bara rollen editor', async () => {
+    const member = (await pool.query("select id, email, role from users where role = 'member' limit 1")).rows[0];
+    const res = await api('/api/guides/1', { method: 'PUT', body, token: sign(member) });
+    expect(res.status).toBe(403);
+  });
+
+  it('en redaktör kan ändra – och får en validerad guide tillbaka', async () => {
+    const editor = (await pool.query("select id, email, role from users where role = 'editor' limit 1")).rows[0];
+    const before = (await pool.query('select * from guides where id = 1')).rows[0];
+    const res = await api('/api/guides/1', {
+      method: 'PUT',
+      token: sign(editor),
+      body: { ...body, title: before.title, region: before.region, difficulty: before.difficulty, lengthKm: before.length_km, bodyHtml: before.body_html, published: before.published },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).title).toBe(before.title);
+    const fel = await api('/api/guides/1', { method: 'PUT', token: sign(editor), body: { ...body, difficulty: 'omöjlig' } });
+    expect(fel.status).toBe(400);
+  });
+});
+
+describe('A02 Security Misconfiguration – CORS', () => {
+  it('API:et skickar ingen Access-Control-Allow-Origin – ingen annan sajt får läsa svaren', async () => {
+    const res = await fetch(`${base}/api/health`, { headers: { origin: 'https://annan-sajt.example' } });
+    expect(res.headers.get('access-control-allow-origin')).toBeNull();
+  });
+});
+
+describe('A05 Injection – sökningen', () => {
+  it("ett citattecken i sökordet ger 200 och en tom lista, inte 500", async () => {
+    const res = await api(`/api/guides/search?q=${encodeURIComponent("'")}`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([]);
+  });
+
+  it('en vanlig sökning hittar guider i landskapet', async () => {
+    const region = (await pool.query('select region from guides limit 1')).rows[0].region;
+    const res = await api(`/api/guides/search?q=${encodeURIComponent(region)}`);
+    expect(res.status).toBe(200);
+    const guides = await res.json();
+    expect(guides.length).toBeGreaterThan(0);
+    for (const g of guides) expect(g.region).toBe(region);
+  });
+});
+
+describe('Validering av indata – A10 Mishandling of Exceptional Conditions', () => {
+  it('en bild med orimliga mått stoppas med 400 innan något sparas', async () => {
+    const owner = await userRow(1);
+    const before = (await pool.query('select count(*)::int as n from photos')).rows[0].n;
+    const res = await api('/api/photos', {
+      method: 'POST',
+      token: sign(owner),
+      body: { tourId: 1, filename: 'enorm.jpg', width: 1_000_000, height: 1_000_000 },
+    });
+    expect(res.status).toBe(400);
+    const svar = await res.json();
+    expect(svar.issues.map((i) => i.path)).toEqual(expect.arrayContaining(['width', 'height']));
+    const after = (await pool.query('select count(*)::int as n from photos')).rows[0].n;
+    expect(after).toBe(before);
+  });
+
+  it('ett id som inte är ett tal ger 400, inte ett ohanterat fel', async () => {
+    const res = await api('/api/tours/abc');
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'ogiltigt id' });
+  });
+
+  it('trasig JSON ger 400 med ett svar – inte ett anrop som hänger', async () => {
+    const res = await fetch(`${base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"email": ',
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'ogiltig JSON' });
+  });
+});
+
+// Fredagens hålsjakt: H1 (PUT /api/guides/:id utan auth) testas ovan under "redaktionens routes".
+// H2–H7 här – varje test var rött mot security-labb-start och är grönt efter fixen.
+describe('Hålsjakten – H2–H7 (fredagens labb)', () => {
+  it('H2 (A01): en medlem kan inte ändra någon annans tur med PATCH (403) – ägaren kan', async () => {
+    const tour = (await pool.query('select id, user_id, title from tours where id = 1')).rows[0];
+    const other = (
+      await pool.query("select id, email, role from users where id <> $1 and role = 'member' limit 1", [tour.user_id])
+    ).rows[0];
+    const res = await api(`/api/tours/${tour.id}`, { method: 'PATCH', token: sign(other), body: { title: 'Kapad tur' } });
+    expect(res.status).toBe(403);
+    expect((await pool.query('select title from tours where id = 1')).rows[0].title).toBe(tour.title);
+
+    const owner = await userRow(tour.user_id);
+    const egen = await api(`/api/tours/${tour.id}`, { method: 'PATCH', token: sign(owner), body: { title: tour.title } });
+    expect(egen.status).toBe(200);
+  });
+
+  it('H3 (A01): role i registreringen ignoreras – nya konton blir member', async () => {
+    const email = `ny.${Date.now()}@example.com`;
+    try {
+      const res = await api('/api/auth/register', {
+        method: 'POST',
+        body: { email, password: 'langtlosen123', displayName: 'Ny', role: 'editor' },
+      });
+      expect(res.status).toBe(201);
+      const svar = await res.json();
+      expect(svar.user.role).toBe('member');
+      expect(jwt.decode(svar.token).role).toBe('member');
+    } finally {
+      await pool.query('delete from users where email = $1', [email]);
+    }
+  });
+
+  it('H4 (A04/A07): en token signerad med det gamla fasta värdet ur .env.example ger 401', async () => {
+    const forfalskad = jwt.sign({ id: 1, email: 'redaktor@utpost.se', role: 'editor' }, 'utpost-dev-secret-byt-i-molnet', {
+      algorithm: 'HS256',
+      expiresIn: '1h',
+    });
+    const res = await api('/api/auth/me', { token: forfalskad });
+    expect(res.status).toBe(401);
+  });
+
+  it('H5 (A01): GET /api/users kräver inloggning (401) och rollen editor (403)', async () => {
+    const utan = await api('/api/users');
+    expect(utan.status).toBe(401);
+    expect(await utan.text()).not.toContain('@');
+    const member = (await pool.query("select id, email, role from users where role = 'member' limit 1")).rows[0];
+    expect((await api('/api/users', { token: sign(member) })).status).toBe(403);
+    const editor = (await pool.query("select id, email, role from users where role = 'editor' limit 1")).rows[0];
+    expect((await api('/api/users', { token: sign(editor) })).status).toBe(200);
+  });
+
+  it('H6 (A02): ett 500-fel svarar utan stack – detaljerna står i loggen', async () => {
+    // Ett id som är ett heltal men för stort för Postgres integer: valideringen släpper igenom det,
+    // databasen kastar (out of range) – och felhanteraren svarar 500.
+    const res = await api('/api/tours/99999999999');
+    expect(res.status).toBe(500);
+    const svar = await res.json();
+    expect(svar).toEqual({ error: 'internt fel' });
+    expect(JSON.stringify(svar)).not.toContain('node_modules');
+  });
+
+  it('H7 (A05, XSS): bodyHtml saneras när guiden sparas – <script> och onerror överlever inte', async () => {
+    const editor = (await pool.query("select id, email, role from users where role = 'editor' limit 1")).rows[0];
+    const before = (await pool.query('select * from guides where id = 1')).rows[0];
+    try {
+      const res = await api('/api/guides/1', {
+        method: 'PUT',
+        token: sign(editor),
+        body: {
+          title: before.title,
+          region: before.region,
+          difficulty: before.difficulty,
+          lengthKm: before.length_km,
+          bodyHtml: '<p>Hej</p><script>alert(1)</script><img src="x" onerror="alert(document.domain)"><a href="javascript:alert(1)">länk</a>',
+          published: before.published,
+        },
+      });
+      expect(res.status).toBe(200);
+      const html = (await pool.query('select body_html from guides where id = 1')).rows[0].body_html;
+      expect(html).toContain('<p>Hej</p>');
+      expect(html).not.toContain('<script');
+      expect(html).not.toContain('onerror');
+      expect(html).not.toContain('javascript:');
+    } finally {
+      await pool.query('update guides set body_html = $1 where id = 1', [before.body_html]);
+    }
+  });
+});
+
+// Fredagens labb (M9): webhooken från CMS:et. Adressen är publik, så testerna gäller två saker:
+// att ingen kommer in utan hemligheten, och att rätt anrop faktiskt tömmer cachen.
+describe('M9 – webhooken från CMS:et', () => {
+  const HEMLIGHET = 'en-lang-webhook-hemlighet-for-testerna';
+  const webhook = (headers = {}) => fetch(`${base}/api/cms/webhook`, { method: 'POST', headers });
+
+  it('utan hemlighet, med fel hemlighet eller när ingen är satt på servern: 401', async () => {
+    config.cmsWebhookSecret = HEMLIGHET;
+    expect((await webhook()).status).toBe(401);
+    expect((await webhook({ 'X-Utpost-Webhook-Secret': 'fel' })).status).toBe(401);
+    config.cmsWebhookSecret = '';
+    expect((await webhook({ 'X-Utpost-Webhook-Secret': '' })).status).toBe(401);
+  });
+
+  it('med rätt hemlighet töms cachen: nästa fråga hämtar från CMS:et igen', async () => {
+    Object.assign(config, { cmsWebhookSecret: HEMLIGHET, cmsSpaceId: 'space1', cmsDeliveryToken: 'nyckel' });
+    clearCmsCache();
+    const riktigFetch = globalThis.fetch;
+    // Bara anropen till Contentful byts ut – testets egna anrop till API:et går som vanligt.
+    const contentful = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ items: [] }) }));
+    vi.stubGlobal('fetch', (url, options) =>
+      String(url).includes('contentful.com') ? contentful(url, options) : riktigFetch(url, options),
+    );
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await publishedNotices();
+    await publishedNotices();
+    expect(contentful).toHaveBeenCalledTimes(1); // andra frågan svarades ur cachen
+
+    const res = await webhook({
+      'X-Utpost-Webhook-Secret': HEMLIGHET,
+      'X-Contentful-Topic': 'ContentManagement.Entry.publish',
+    });
+    expect(res.status).toBe(204);
+
+    await publishedNotices();
+    expect(contentful).toHaveBeenCalledTimes(2); // cachen var tömd
+
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    Object.assign(config, { cmsWebhookSecret: '', cmsSpaceId: '', cmsDeliveryToken: '' });
+    clearCmsCache();
+  });
+});
