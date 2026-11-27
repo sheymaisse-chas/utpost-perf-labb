@@ -156,6 +156,46 @@ jobs:
         if: failure()
         run: docker compose logs --tail 50 api client
 
+  # M10: prestandabudgeten – ett test som alla andra, fast det mäter vikt och tid i stället för rätt och fel.
+  # Jobbet startar hela appen som i compose (samma image som deployas, bakom nginx), kör Lighthouse mot
+  # startsidan, en guide och en tur (npm run perf, tre körningar per sida) och jämför med gränserna i
+  # lighthouserc.json. En gräns med "error" som bryts gör jobbet rött, en med "warn" skriver bara en varning.
+  # Storlekarna (byte över nätet) är samma i varje körning och får stoppa en merge. Tiden (LCP) beror på
+  # maskinen jobbet råkar få – den varnar bara. Rapporterna laddas upp som artefakt.
+  # Rött här blockerar merge (branch protection kräver "Prestanda").
+  performance:
+    name: Prestanda
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Bygg imagerna och starta appen (compose)
+        run: JWT_SECRET="$(openssl rand -hex 32)" docker compose up -d --build --wait
+
+      # Skriptet väntar själv tills API:et har seedat och svarar. Det behöver inga node_modules:
+      # Lighthouse CI hämtas med npx, och Chrome finns redan på runnern.
+      - name: Mät – Lighthouse mot startsidan, en guide och en tur
+        run: npm run perf -- --runs 3
+
+      - name: Budgeten – gränserna i lighthouserc.json
+        run: npx --yes @lhci/cli@0.16.1 assert
+
+      - name: Spara rapporterna
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-rapporter
+          path: .lighthouseci
+          include-hidden-files: true # mappen börjar med punkt – utan den här raden laddas ingenting upp
+          retention-days: 7
+
+      - name: Loggar från appen (bara om något gick fel)
+        if: failure()
+        run: docker compose logs --tail 50 api client
+
   build:
     name: Bygg
     runs-on: ubuntu-latest # körs parallellt med quality – de behöver inte varandra
