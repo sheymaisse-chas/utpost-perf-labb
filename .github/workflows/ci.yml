@@ -1,4 +1,4 @@
-# Utpost – CI (M1, utbyggd i M4, M5, M6, M7, M8)
+# Utpost – CI (M1, utbyggd i M4, M5, M6, M7, M8, M10)
 # Varje PR mot main och varje push till main: lint, formatkontroll, typkontroll, tester och bygge.
 # Rött någonstans = PR:en får inte mergas (branch protection kräver "Kvalitet", "Bygg", "Integration" och "Image").
 # M4: jobbet Image bygger Docker-imagerna. På PR byggs de bara (går Dockerfilen igenom?),
@@ -6,6 +6,7 @@
 # M5: jobbet Integration kör API-testerna mot riktiga databaser som startas för jobbet (services).
 # M6: jobbet Deploy → Azure staging byter image i staging efter merge till main.
 # M7: jobbet Deploy → Azure Functions lägger upp functions/ i function-appen efter merge till main.
+# M10: jobbet Prestanda mäter den körande appen med Lighthouse och jämför med budgeten i lighthouserc.json.
 name: CI
 
 on:
@@ -31,12 +32,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm            # cachar ~/.npm nycklat på package-lock.json
-      - run: npm ci             # installerar alla workspaces (shared, api, client) – exakt enligt lockfilen
+          cache: npm # cachar ~/.npm nycklat på package-lock.json
+      - run: npm ci # installerar alla workspaces (shared, api, client) – exakt enligt lockfilen
       - run: npm run lint
       - run: npm run format:check
-      - run: npm run typecheck   # M2: vue-tsc i client/ och tsc i api/. M5: kör codegen först – schema → fråga → vy kontrolleras här
-      - run: npm test            # klientens tester (Vitest + Testing Library, API:et mockat)
+      - run: npm run typecheck # M2: vue-tsc i client/ och tsc i api/. M5: kör codegen först – schema → fråga → vy kontrolleras här
+      - run: npm test # klientens tester (Vitest + Testing Library, API:et mockat)
 
   # M5: integrationstester mot GraphQL-servern med riktig databas. Postgres och Mongo startas som
   # services bredvid jobbet – samma images som i compose.yaml – och nås på localhost.
@@ -51,7 +52,7 @@ jobs:
           POSTGRES_PASSWORD: utpost
           POSTGRES_DB: utpost
         ports:
-          - 5432:5432              # i jobbet: localhost:5432 (inte 5433 som på din dator)
+          - 5432:5432 # i jobbet: localhost:5432 (inte 5433 som på din dator)
         options: >-
           --health-cmd "pg_isready -U utpost -d utpost"
           --health-interval 5s
@@ -80,8 +81,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run seed          # tom databas → testdata, exakt som lokalt
-      - run: npm run migrate:logs  # mätpunkterna till Mongo – testet för Tour.logs kräver det
+      - run: npm run seed # tom databas → testdata, exakt som lokalt
+      - run: npm run migrate:logs # mätpunkterna till Mongo – testet för Tour.logs kräver det
       - run: npm run test:api
 
   # M8: säkerhetsskanning. Tre verktyg, tre frågor, i den ordning de blir dyrare:
@@ -113,11 +114,11 @@ jobs:
         with:
           scan-type: fs
           scan-ref: .
-          skip-dirs: spike            # M10: spiken i spike/ är ett experiment med egen lockfil – den byggs och deployas inte
+          skip-dirs: spike # M10: spiken i spike/ är ett experiment med egen lockfil – den byggs och deployas inte
           scanners: vuln,secret,misconfig
           severity: HIGH,CRITICAL
           ignore-unfixed: true
-          exit-code: '1'
+          exit-code: "1"
           trivyignores: .trivyignore
 
       # Hela appen startas som i compose – det är den ZAP ska anropa, och api-imagen som Trivy ska skanna.
@@ -132,7 +133,7 @@ jobs:
           image-ref: utpost-api
           severity: HIGH,CRITICAL
           ignore-unfixed: true
-          exit-code: '1'
+          exit-code: "1"
           trivyignores: .trivyignore
 
       # ZAP baseline: spindlar sidan en minut och kör de passiva reglerna på varje svar.
@@ -144,9 +145,9 @@ jobs:
       - name: Appen – ZAP baseline (DAST) mot den körande appen
         uses: zaproxy/action-baseline@v0.15.0
         with:
-          target: 'http://localhost:3001'
-          rules_file_name: '.zap/rules.tsv'
-          cmd_options: '-a -I'
+          target: "http://localhost:3001"
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-a -I"
           fail_action: true
           allow_issue_writing: false
           artifact_name: zap-rapport
@@ -155,9 +156,49 @@ jobs:
         if: failure()
         run: docker compose logs --tail 50 api client
 
+  # M10: prestandabudgeten – ett test som alla andra, fast det mäter vikt och tid i stället för rätt och fel.
+  # Jobbet startar hela appen som i compose (samma image som deployas, bakom nginx), kör Lighthouse mot
+  # startsidan, en guide och en tur (npm run perf, tre körningar per sida) och jämför med gränserna i
+  # lighthouserc.json. En gräns med "error" som bryts gör jobbet rött, en med "warn" skriver bara en varning.
+  # Storlekarna (byte över nätet) är samma i varje körning och får stoppa en merge. Tiden (LCP) beror på
+  # maskinen jobbet råkar få – den varnar bara. Rapporterna laddas upp som artefakt.
+  # Rött här blockerar merge (branch protection kräver "Prestanda").
+  performance:
+    name: Prestanda
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Bygg imagerna och starta appen (compose)
+        run: JWT_SECRET="$(openssl rand -hex 32)" docker compose up -d --build --wait
+
+      # Skriptet väntar själv tills API:et har seedat och svarar. Det behöver inga node_modules:
+      # Lighthouse CI hämtas med npx, och Chrome finns redan på runnern.
+      - name: Mät – Lighthouse mot startsidan, en guide och en tur
+        run: npm run perf -- --runs 3
+
+      - name: Budgeten – gränserna i lighthouserc.json
+        run: npx --yes @lhci/cli@0.16.1 assert
+
+      - name: Spara rapporterna
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-rapporter
+          path: .lighthouseci
+          include-hidden-files: true # mappen börjar med punkt – utan den här raden laddas ingenting upp
+          retention-days: 7
+
+      - name: Loggar från appen (bara om något gick fel)
+        if: failure()
+        run: docker compose logs --tail 50 api client
+
   build:
     name: Bygg
-    runs-on: ubuntu-latest     # körs parallellt med quality – de behöver inte varandra
+    runs-on: ubuntu-latest # körs parallellt med quality – de behöver inte varandra
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -175,10 +216,10 @@ jobs:
   image:
     name: Image
     runs-on: ubuntu-latest
-    needs: [quality, build]    # ingen image av kod som inte klarat kontrollerna
+    needs: [quality, build] # ingen image av kod som inte klarat kontrollerna
     permissions:
       contents: read
-      packages: write          # GITHUB_TOKEN får publicera i GHCR – bara i det här jobbet
+      packages: write # GITHUB_TOKEN får publicera i GHCR – bara i det här jobbet
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -202,12 +243,12 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
       - uses: docker/build-push-action@v6
         with:
-          context: .                   # repots rot, som i compose.yaml
+          context: . # repots rot, som i compose.yaml
           file: api/Dockerfile
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta-api.outputs.tags }}
           labels: ${{ steps.meta-api.outputs.labels }}
-          build-args: GIT_SHA=${{ github.sha }}   # M6: syns i /api/health – deploysteget väntar på den
+          build-args: GIT_SHA=${{ github.sha }} # M6: syns i /api/health – deploysteget väntar på den
           cache-from: type=gha,scope=api
           cache-to: type=gha,mode=max,scope=api
 
@@ -234,18 +275,18 @@ jobs:
   deploy:
     name: Deploy → Azure staging
     runs-on: ubuntu-latest
-    needs: [image, integration]                      # samma image som Image publicerade; aldrig en deploy av kod med röda API-tester
+    needs: [image, integration] # samma image som Image publicerade; aldrig en deploy av kod med röda API-tester
     # M8: körs bara om miljön azure-staging har sina variabler – i ett repo utan Azure (labbparen) hoppas jobbet över i stället för att bli rött.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AZURE_APP != ''
     environment:
-      name: azure-staging                            # variablerna (id:n och adressen) ligger på miljön, inte i repot
+      name: azure-staging # variablerna (id:n och adressen) ligger på miljön, inte i repot
       url: ${{ vars.AZURE_URL }}
     permissions:
-      id-token: write                                # får be GitHub om en kortlivad OIDC-token – det finns ingen lösenordshemlighet
+      id-token: write # får be GitHub om en kortlivad OIDC-token – det finns ingen lösenordshemlighet
       contents: read
     concurrency:
       group: deploy-staging
-      cancel-in-progress: false                      # två deployer i rad får köa, inte avbryta varandra
+      cancel-in-progress: false # två deployer i rad får köa, inte avbryta varandra
     steps:
       - name: Logga in i Azure med GitHubs identitet (OIDC)
         uses: azure/login@v3
@@ -315,12 +356,12 @@ jobs:
   deploy-function:
     name: Deploy → Azure Functions
     runs-on: ubuntu-latest
-    needs: [quality]                                 # functions/ har inga egna tester – men ingen deploy av en röd main
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AZURE_FUNCTION_APP != ''   # M8: hoppas över utan Azure-variabler, som Deploy → Azure staging
+    needs: [quality] # functions/ har inga egna tester – men ingen deploy av en röd main
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AZURE_FUNCTION_APP != '' # M8: hoppas över utan Azure-variabler, som Deploy → Azure staging
     environment:
-      name: azure-staging                            # AZURE_FUNCTION_APP ligger här bredvid id:n från M6
+      name: azure-staging # AZURE_FUNCTION_APP ligger här bredvid id:n från M6
     permissions:
-      id-token: write                                # OIDC-token, inget lösenord
+      id-token: write # OIDC-token, inget lösenord
       contents: read
     concurrency:
       group: deploy-function
@@ -355,7 +396,7 @@ jobs:
         with:
           app-name: ${{ vars.AZURE_FUNCTION_APP }}
           package: functions
-          respect-funcignore: true                   # local.settings*.json följer inte med
+          respect-funcignore: true # local.settings*.json följer inte med
 
       - name: Röktest – process-image svarar med fyra varianter
         env:
